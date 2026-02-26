@@ -20,6 +20,7 @@ from pathlib import Path
 from hop.scripts import robot_corrections as corrections
 from hop.scripts import robot_file_input_output as file_functions
 
+
 pd.options.mode.chained_assignment = (
     None  # disabled warning about writes making it back to the original frame
 )
@@ -91,6 +92,7 @@ def correct_robot_file(
     alpha=1.2e-6,
     robot_centre=[324.470, 297.834],
     robot_shifts_file="./robot_shifts_abs.csv",
+    apply_optical_model_correction=True,
     apply_telecentricity_correction=True,
     apply_metrology_calibration=True,
     apply_roll_correction=True,
@@ -145,6 +147,7 @@ def correct_robot_file(
         alpha=alpha,
         robot_centre=robot_centre,
         robot_shifts_file=robot_shifts_file,
+        apply_optical_model_correction=apply_optical_model_correction,
         apply_telecentricity_correction=apply_telecentricity_correction,
         apply_metrology_calibration=apply_metrology_calibration,
         apply_roll_correction=apply_roll_correction,
@@ -153,7 +156,7 @@ def correct_robot_file(
         metrology_sign=metrology_sign,
         rotation_axis_misalignment_sign=rotation_axis_misalignment_sign,
         apply_barrel_rotation_to_all_magnets=apply_barrel_rotation_to_all_magnets,
-        barrel_rotation_sign=barrel_rotation_sign,
+        barrel_rotation_sign=barrel_rotation_sign
     )
 
     df, output_file = file_functions.write_standard_robot_file(df, filename, header)
@@ -173,6 +176,7 @@ def apply_corrections(
     plate_radius=226.0,
     alpha=1.2e-6,
     robot_centre=[324.470, 297.834],
+    apply_optical_model_correction=False,
     apply_telecentricity_correction=True,
     apply_metrology_calibration=True,
     apply_roll_correction=True,
@@ -234,6 +238,11 @@ def apply_corrections(
             )
         delta_T = T_configured - T_observed
         offset = plate_radius * (delta_T * alpha)
+
+    # Apply the optical model correction
+    if apply_optical_model_correction:
+        df = corrections.optical_model_correction(df, robot_centre, verbose=verbose)
+
 
     # Apply the radial offsets
     if (offset != 0) or (apply_telecentricity_correction is True):
@@ -313,6 +322,8 @@ def apply_corrections(
             raise NameError(
                 f"The value of barrel_rotation_sign must be 'positive' or 'negative'. Currently it is {barrel_rotation_sign}"
             )
+
+ 
     return df
 
 
@@ -477,6 +488,7 @@ if __name__ == "__main__":
     #parking_positions_filename = (
     #    r"Z:\Robot_tile_files\ParkingPosns_211116-z25.620_final.csv"
     #)
+
     parking_positions_filename = (
         r"Z:\Robot_tile_files\ParkingPosns_211116-z25.570_final.csv"
     )
@@ -496,6 +508,7 @@ if __name__ == "__main__":
         T_observed=T_observed,
         T_configured=T_configured,
         verbose=verbose,
+        apply_optical_model_correction=True, # The optical model correction keyword
         metrology_sign="negative",
         rotation_axis_misalignment_sign="positive",
         apply_barrel_rotation_to_all_magnets=True,
