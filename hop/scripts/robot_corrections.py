@@ -7,6 +7,9 @@ from scipy.optimize import curve_fit
 import matplotlib.pyplot as plt
 import warnings
 from pathlib import Path
+from sympy import symbols, Eq, solve
+import math
+
 
 pd.options.mode.chained_assignment = (
     None  # disabled warning about writes making it back to the original frame
@@ -48,9 +51,12 @@ def pick_up_arm_rotation_correction(
     #d = (
     #    factor * 3.5 * 0.001
     #)  # distance from center of pick up arm to center of rotation in [um]. Changed on Oct 2024 to be 3.5 micron after Robot Realignment
+    #d = (
+    #    factor * 4.2 * 0.001
+    #)  # distance from center of pick up arm to center of rotation in [um]. Changed on Jul 2025 to be 4.2 micron after Robot Realignment
     d = (
-        factor * 4.2 * 0.001
-    )  # distance from center of pick up arm to center of rotation in [um]. Changed on Jul 2025 to be 3.5 micron after Robot Realignment
+        factor * 2.9 * 0.001
+    )  # distance from center of pick up arm to center of rotation in [um]. Changed on Jun 2026 to be 2.9 micron after Robot Realignment
 
     # ang0 = 20  # when the pickup arm is rotated to give the maximum shift above, the rotation axis is actually ang0 deg from the +x axis. The rotation direction is clockwise
     #ang0 = 90  # changed on April 2024
@@ -377,3 +383,161 @@ def roll_correction(centre_x, centre_y, magnet):
     roll_offset_centre_x = a * centre_y**2 + b * centre_y + c
 
     return roll_offset_centre_x
+
+
+def optical_model_correction(df, robot_centre, verbose=True):
+    if verbose:
+        print("\n\t--> Applying the optical model correction <-- \n")
+
+
+    # Loop through the hexabundles
+    all_hexabundles = df.loc[df["Magnet"] == "circular_magnet", "Hexabundle"].values
+    for hexabundle in all_hexabundles:
+        circular_magnet = df.loc[
+            (df["Hexabundle"] == hexabundle) & (df["Magnet"] == "circular_magnet")
+            ]
+        rectangular_magnet = df.loc[
+            (df["Hexabundle"] == hexabundle) & (df["Magnet"] == "rectangular_magnet")
+            ]
+
+        newCirc_x, newCirc_y = calculate_optical_model_correction(
+            circular_magnet, robot_centre
+        )
+
+        if verbose:
+            print( f"\tHexabundle {hexabundle}: \n\tCircular magnet:" )
+            print( f"\t\toriginal centre is ({circular_magnet['Center_x'].values[0]:.3f}, "
+                   f"{circular_magnet['Center_y'].values[0]:.3f})" )
+            print( f"\t\tnew (optical model corrected) centre is ({newCirc_x:.3f}, {newCirc_y:.3f})" )
+
+        # Update the new centres of the circular magnets
+        df.at[circular_magnet.index[0], "Center_x"] = newCirc_x
+        df.at[circular_magnet.index[0], "Center_y"] = newCirc_y
+
+
+        # Now find the centres of the rectangular magnets
+        angle_for_rectangular_magnet = np.radians(
+            270
+            - rectangular_magnet["rot_holdingPosition"]
+            - rectangular_magnet["rot_platePlacing"]
+        ).values[0]
+
+        new_x, new_y = newCirc_x - robot_centre[0], newCirc_y - robot_centre[1] # Subtract the robot center
+        [x_rect, y_rect] = calculate_rectangular_magnet_centre_coordinates(
+            new_x, new_y, angle_for_rectangular_magnet
+        )
+
+        if verbose:
+            print( "\tRectangular magnet:" )
+            print( f"\t\toriginal centre is ({rectangular_magnet['Center_x'].values[0]:.3f}, "
+                   f"{rectangular_magnet['Center_y'].values[0]:.3f})" )
+            print( f"\t\tnew centre is ({x_rect + robot_centre[0]:.3f}, {y_rect + robot_centre[1]:.3f})" )
+
+        # Update the new centres of the rectangular magnets
+        df.at[rectangular_magnet.index[0], "Center_x"] = x_rect + robot_centre[0]
+        df.at[rectangular_magnet.index[0], "Center_y"] = y_rect + robot_centre[1]
+
+    return df
+
+
+def calculate_optical_model_correction(df_circular, robot_centre):
+
+    def calculate_angles(point1, point2):
+        """
+        Calculates the angle between the origin (in this case, robot center)
+        and a given point, with respect to the +ve x-axis
+
+        anti-clockwise from +ve x-direction to 180-deg gives the angle in +ve radians
+        clocwise from +ve x-directions to -180-deg gives the angle in -ve radians
+        """
+        x1, y1 = point1
+        x2, y2 = point2
+
+        dx, dy = x2 - x1, y2 - y1   # calculate the difference in coordinates
+        angle = math.atan2(dy, dx)  # the angle in radians
+
+        return angle, np.sign(angle)
+
+
+    def new_coordinates(magnetPos, robotCenter, Rperpendicular):
+        magnetPosX, magnetPosY     = magnetPos
+        robotCenterX, robotCenterY = robotCenter
+
+        radial_robotCenter_to_magnet = np.sqrt((robotCenterX - magnetPosX) ** 2.0 + (robotCenterY - magnetPosY) ** 2.0)
+
+        # Solve the equation
+        x, y = symbols('x,y')
+        eq1 = Eq((robotCenterX - x) ** 2.0 + (robotCenterY - y) ** 2.0, radial_robotCenter_to_magnet ** 2.0)
+        eq2 = Eq((magnetPosX - x) ** 2.0 + (magnetPosY - y) ** 2.0, Rperpendicular ** 2.0)
+
+        # Returns two sets of x/y coordinates, either side of the original hexa position
+        # (the same Rperpendist away from the initial probe position, either side of the probe)
+        result_nonlinear = solve([eq1, eq2], (x, y))
+
+        # Depending on the sign of the "RPerpenDistance_estimate", we need to select the correct coordinate set that
+        # "result_nonlinear" returns. To do that, we need to check the angles.
+        angle1, sign1 = calculate_angles((robotCenterX, robotCenterY), result_nonlinear[0])
+        angle2, sign2 = calculate_angles((robotCenterX, robotCenterY), result_nonlinear[1])
+
+        argmax_angle, argmin_angle = np.argmax([angle1, angle2]), np.argmin([angle1, angle2])
+
+        if sign1 == sign2:  # Either both angles are positive or both negative
+            # Rperpendicular < 0: The hexa centers need to move clockwise (in inverted y-axis coordinate system used
+            # in quicklook plots) Or anti-clockwise if the y-axis was not inverted.
+            if Rperpendicular < 0: new_point = result_nonlinear[argmax_angle]
+
+            # Rperpendicular > 0: The hexa centers need to move anti-clockwise (in inverted y-axis coordinate system used
+            # in quicklook plots) Or clockwise if the y-axis was not inverted.
+            else: new_point = result_nonlinear[argmin_angle]
+
+        # Special Cases (+ve and -ve angles can happen if hexa position is @0 deg or @180 deg)
+        else:
+            print(f"Encountered a special case - the angles are +/-ve in radians (i.e. {angle1, angle2})")
+            argmin_sign    = np.argmin([sign1, sign2])                               # Which angle is -ve?
+            angles_degrees = np.array([math.degrees(angle1), math.degrees(angle2)])  # Angles in degrees (easier to deal with)
+            angles_degrees[argmin_sign] = 360. + angles_degrees[argmin_sign]         # Add 360 to -ve angle [deg], so both angles are now positive
+
+            arg_max, arg_min = np.argmax(angles_degrees), np.argmin(angles_degrees)
+
+            # Rperpendicular < 0: Hexa center needs to move clockwise (if y-axis inverted), anti-clockwise if not
+            if Rperpendicular < 0:
+                if 180. < angles_degrees[arg_max] <= 270.:  # hexa@180 degrees: anti-clockwise move (if y-axis not inverted) --> the largest angle in 3rd quadrant
+                    new_point = result_nonlinear[arg_max]
+                else:                                       # hexa@0 degrees: anti-clockwise move --> the smallest angle in 1st quadrant
+                    new_point = result_nonlinear[arg_min]
+
+            # Rperpendicular > 0: Hexa center needs to move anti-clockwise (if y-axis inverted), clockwise if not
+            else:
+                if 90. < angles_degrees[arg_min] <= 180.:   # hexa@180 degrees: clockwise move (if y-axis not inverted) --> the smallest angle
+                    new_point = result_nonlinear[arg_min]
+                else:                                       # hexa@0 degrees: clockwise move --> the largest angles
+                    new_point = result_nonlinear[arg_max]
+
+        return new_point, (sign1, sign2)
+
+
+    # Polynomial Coefficients from the fitting done in 'process_quicklook_files'
+    # coeffs = [-5.10579247e-03, -9.08942022e-01, 1.94332118e+02] # Original coeffs from fitting Nov2025 data
+    coeffs = [-0.007449708120000001, -0.20090739999999996, 156.2815041] # Original revised with the residual correction seen in Feb2026 data
+    polynomial = np.poly1d(coeffs)
+
+    # Polynomial correction is based only on the circular magnet position
+    center_x, center_y = df_circular['Center_x'].values[0], df_circular['Center_y'].values[0]
+
+    circProbeX, circProbeY = center_y * 1.0E3, center_x * 1.0E3                 # Convert from mm to microns and switch x/y
+    plateX, plateY         = robot_centre[1] * 1.0E3, robot_centre[0] * 1.0E3   # Convert from mm to microns and switch x/y
+
+    radial_robotCenter_to_probe = np.sqrt((plateX - circProbeX) ** 2.0 + (plateY - circProbeY) ** 2.0)
+
+    # Use the polynomial function to estimate the correction
+    # Note: In the polynomial coeff estimation, the "radial_plate_to_hexabundle" distance (i.e. radial_robotCenter_to_probe)
+    #       was scaled by 1E3, which is applied consistently below.
+    RPerpenDistance_estimate = polynomial(radial_robotCenter_to_probe / 1.0E3)
+
+    correctedPos, signs = new_coordinates((circProbeX, circProbeY), (plateX, plateY), RPerpenDistance_estimate)
+
+
+    return  correctedPos[1] / 1.0E3, correctedPos[0] / 1.0E3  # return the corrected points back in unit of mm (the return order is y/x in robot coordinates)
+
+
+
